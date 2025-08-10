@@ -1,0 +1,14 @@
+[project]
+name = "follow-that-page"
+version = "0.1.0"
+description = "Simple webpage change checker"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "beautifulsoup4>=4.13.4",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32.4",
+    "google-genai>=1.0.0",
+]
+
+
