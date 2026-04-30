@@ -1,0 +1,15 @@
+[Unit]
+Description=Follow That Page Telegram bot daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/follow-that-page
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/uv run python telegram_daemon.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
