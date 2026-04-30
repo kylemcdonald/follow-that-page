@@ -26,13 +26,14 @@ Loaded from `.env` via `python-dotenv`.
 
 ```
 GEMINI_API_KEY=
+GEMINI_MODEL=gemini-flash-latest
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_OWNER_USERNAME=kcimc
 CHECK_INTERVAL_SECONDS=300
 ```
 
-By default the app reads `.env`. You can keep local values in `.env.local`; copy it to `.env` for the app to load.
+The app reads `.env`.
 
 ## Usage
 
@@ -66,9 +67,10 @@ uv run python telegram_daemon.py
 ## Notes
 
 - A `.cache/` directory is created to store the last-seen HTML snippets for diffs.
-- HTTP status transitions also trigger notifications, including cases like `404 -> 200`.
+- HTTP status transitions trigger notifications, including cases like `404 -> 200`.
+- Transport failures such as invalid SSL certificates, timeouts, and connection errors are also tracked, so transitions like `ssl_error -> HTTP 200` trigger notifications.
 - Notifications are sent through the Telegram Bot API with a short Gemini-generated summary followed by the page URL.
-- The summarization uses model `gemini-2.5-flash` via the `google-genai` Python SDK.
+- The summarization uses `GEMINI_MODEL`, defaulting to `gemini-flash-latest`, via the `google-genai` Python SDK.
 - The Telegram bot accepts commands only from the configured owner username and chat ID.
 
 ## Telegram setup
@@ -96,6 +98,8 @@ CHECK_INTERVAL_SECONDS=300
 
 - `/follow <url> [selector]` adds a page to monitor. If no selector is provided, it uses `body`. Non-200 pages can still be followed so you can detect when they go live later.
 - `/list` shows all followed pages and includes delete buttons.
+- `/interval` shows the current check interval.
+- `/interval <seconds>` sets the check interval. Minimum is `30`.
 - `/help` shows command help.
 
 ## systemd

@@ -1,4 +1,5 @@
 import sys
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -8,10 +9,10 @@ from botlib import monitor_jobs_once, resolve_telegram_config
 
 
 def main() -> int:
-    load_dotenv()
+    load_dotenv(override=True)
 
     try:
-        gemini_client = genai.Client()
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     except Exception as exc:
         print(f"Gemini client init error: {exc}", file=sys.stderr)
         return 2

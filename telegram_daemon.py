@@ -1,5 +1,7 @@
 import sys
 import time
+import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -26,6 +28,7 @@ from botlib import (
 
 
 CHECK_INTERVAL_SECONDS = 300
+DEFAULT_CONFIG_PATH = Path(".bot_config.json")
 
 
 def parse_check_interval() -> int:
@@ -33,6 +36,39 @@ def parse_check_interval() -> int:
 
     raw = os.getenv("CHECK_INTERVAL_SECONDS", str(CHECK_INTERVAL_SECONDS)).strip()
     return max(30, int(raw))
+
+
+def load_runtime_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    if not config_path.exists():
+        return {}
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_runtime_config(config: Dict[str, Any], config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def get_check_interval_seconds(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+    config = load_runtime_config(config_path)
+    value = config.get("check_interval_seconds")
+    if isinstance(value, int):
+        return max(30, value)
+    return parse_check_interval()
+
+
+def set_check_interval_seconds(seconds: int, config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+    config = load_runtime_config(config_path)
+    config["check_interval_seconds"] = max(30, seconds)
+    save_runtime_config(config, config_path)
+    return config["check_interval_seconds"]
 
 
 def is_authorized_actor(actor: Dict[str, Any], expected_username: str) -> bool:
@@ -111,6 +147,8 @@ def send_help(bot_token: str, chat_id: str) -> None:
         "Commands:\n"
         "/follow <url> [selector] - add a page to monitor. Default selector is body.\n"
         "/list - show followed links and delete buttons.\n"
+        "/interval - show the current check interval.\n"
+        "/interval <seconds> - set the check interval, minimum 30.\n"
         "/help - show this message."
     )
     send_telegram_message(bot_token=bot_token, chat_id=chat_id, body=help_text)
@@ -146,39 +184,73 @@ def handle_list(bot_token: str, chat_id: str) -> None:
     )
 
 
+def handle_interval(bot_token: str, chat_id: str, text: str) -> Optional[int]:
+    parts = text.split(maxsplit=1)
+    if len(parts) == 1:
+        current = get_check_interval_seconds()
+        send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            body=f"Current check interval: {current} seconds.",
+        )
+        return None
+
+    try:
+        requested = int(parts[1].strip())
+    except ValueError:
+        send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            body="Usage: /interval <seconds>. Minimum is 30.",
+        )
+        return None
+
+    current = set_check_interval_seconds(requested)
+    send_telegram_message(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        body=f"Check interval set to {current} seconds.",
+    )
+    return current
+
+
 def handle_message(
     *,
     bot_token: str,
     chat_id: str,
     owner_username: str,
     message: Dict[str, Any],
-) -> None:
+) -> Optional[int]:
     if not is_authorized_message(message, chat_id, owner_username):
         print("[telegram] Ignoring unauthorized message")
-        return
+        return None
 
     text = (message.get("text") or "").strip()
     if not text:
-        return
+        return None
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0]
     if command in {"/start", "/help"}:
         send_help(bot_token, chat_id)
-        return
+        return None
 
     if command == "/follow":
         handle_follow(bot_token, chat_id, text)
-        return
+        return None
 
     if command == "/list":
         handle_list(bot_token, chat_id)
-        return
+        return None
+
+    if command == "/interval":
+        return handle_interval(bot_token, chat_id, text)
 
     send_telegram_message(
         bot_token=bot_token,
         chat_id=chat_id,
         body="Unknown command. Use /help.",
     )
+    return None
 
 
 def handle_callback_query(
@@ -226,10 +298,11 @@ def process_updates(
     chat_id: str,
     owner_username: str,
     offset_path: Path,
-) -> Optional[int]:
+) -> Tuple[Optional[int], Optional[int]]:
     offset = load_offset(offset_path)
     updates = get_updates(bot_token, offset=offset, timeout=20)
     latest_offset: Optional[int] = None
+    interval_override: Optional[int] = None
 
     for update in updates:
         update_id = update.get("update_id")
@@ -237,12 +310,14 @@ def process_updates(
             latest_offset = update_id + 1
 
         if "message" in update:
-            handle_message(
+            maybe_interval = handle_message(
                 bot_token=bot_token,
                 chat_id=chat_id,
                 owner_username=owner_username,
                 message=update["message"],
             )
+            if maybe_interval is not None:
+                interval_override = maybe_interval
 
         if "callback_query" in update:
             handle_callback_query(
@@ -255,20 +330,20 @@ def process_updates(
     if latest_offset is not None:
         save_offset(latest_offset, offset_path)
 
-    return latest_offset
+    return latest_offset, interval_override
 
 
 def main() -> int:
-    load_dotenv()
+    load_dotenv(override=True)
 
     try:
-        gemini_client = genai.Client()
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         bot_token, chat_id, owner_username = resolve_telegram_config()
     except Exception as exc:
         print(f"Startup error: {exc}", file=sys.stderr)
         return 2
 
-    interval_seconds = parse_check_interval()
+    interval_seconds = get_check_interval_seconds()
     next_check_at = time.monotonic()
 
     print("[daemon] Telegram bot daemon started")
@@ -278,12 +353,16 @@ def main() -> int:
 
     while True:
         try:
-            process_updates(
+            _, maybe_interval = process_updates(
                 bot_token=bot_token,
                 chat_id=chat_id,
                 owner_username=owner_username,
                 offset_path=DEFAULT_OFFSET_PATH,
             )
+            if maybe_interval is not None and maybe_interval != interval_seconds:
+                interval_seconds = maybe_interval
+                next_check_at = time.monotonic() + interval_seconds
+                print(f"[daemon] Check interval updated: {interval_seconds}s")
 
             now = time.monotonic()
             if now >= next_check_at:

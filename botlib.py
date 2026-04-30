@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from google import genai
+from google.genai import types
 
 from follow_that_page import ChangeResult, check_page_for_changes, fetch_page_state
 
@@ -97,6 +98,7 @@ def delete_job(job_id: str, json_path: Path = DEFAULT_JOBS_PATH) -> Optional[Job
 def summarize_diff_with_gemini(
     client: genai.Client, url: str, selector: str, diff_text: str
 ) -> str:
+    model_name = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
     prompt = (
         "Summarize the following unified diff for a web page section. "
         "For example, if the diff describes the addition or removal of an item in a marketplace, "
@@ -107,11 +109,25 @@ def summarize_diff_with_gemini(
         f"{diff_text}"
     )
     print(f"[gemini] Generating summary for {url} ({selector})...")
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=prompt)],
+        )
+    ]
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="HIGH")
     )
-    summary_text = response.text or ""
+    pieces: List[str] = []
+    for chunk in client.models.generate_content_stream(
+        model=model_name,
+        contents=contents,
+        config=config,
+    ):
+        if chunk.text:
+            pieces.append(chunk.text)
+
+    summary_text = "".join(pieces).strip()
     if summary_text:
         print(f"[gemini] Summary generated for {url} ({selector}):")
         print(summary_text)
@@ -204,7 +220,7 @@ def save_offset(offset: int, offset_path: Path = DEFAULT_OFFSET_PATH) -> None:
 
 def validate_follow_target(url: str, selector: str) -> None:
     state = fetch_page_state(url, selector)
-    if state.status_code == 200 and state.selected_html is None:
+    if state.state_kind == "http" and state.status_code == 200 and state.selected_html is None:
         raise ValueError(f"Selector not found: {selector}")
 
 
@@ -219,7 +235,7 @@ def build_notification_message(
 
     if change.status_changed:
         parts.append(
-            f"HTTP status changed: {change.previous_status_code} -> {change.current_status_code}"
+            f"State changed: {change.previous_state_label} -> {change.current_state_label}"
         )
 
     if change.diff_text:
@@ -241,6 +257,8 @@ def build_notification_message(
 
         if summary:
             parts.append(summary)
+        else:
+            parts.append(f"Content changed for selector {selector}")
 
     if not parts:
         return None
@@ -264,9 +282,6 @@ def monitor_jobs_once(
             change = check_page_for_changes(job.url, job.selector)
         except ValueError as exc:
             print(f"[{job.url}] selector error: {exc}")
-            continue
-        except requests.RequestException as exc:
-            print(f"[{job.url}] network error: {exc}")
             continue
 
         if not change.changed:

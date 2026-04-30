@@ -12,22 +12,25 @@ from bs4 import BeautifulSoup
 
 @dataclass
 class PageState:
-    status_code: int
+    state_kind: str
+    status_code: Optional[int]
+    error_kind: Optional[str]
+    error_detail: Optional[str]
     selected_html: Optional[str]
 
 
 @dataclass
 class ChangeResult:
-    previous_status_code: Optional[int]
-    current_status_code: int
+    previous_state_label: Optional[str]
+    current_state_label: str
     diff_text: Optional[str]
     selected_html: Optional[str]
 
     @property
     def status_changed(self) -> bool:
         return (
-            self.previous_status_code is not None
-            and self.previous_status_code != self.current_status_code
+            self.previous_state_label is not None
+            and self.previous_state_label != self.current_state_label
         )
 
     @property
@@ -67,21 +70,70 @@ def _request_page(url: str) -> requests.Response:
 
 
 def fetch_page_state(url: str, selector: str) -> PageState:
-    resp = _request_page(url)
+    try:
+        resp = _request_page(url)
+    except requests.exceptions.SSLError as exc:
+        return PageState(
+            state_kind="transport_error",
+            status_code=None,
+            error_kind="ssl_error",
+            error_detail=str(exc),
+            selected_html=None,
+        )
+    except requests.exceptions.Timeout as exc:
+        return PageState(
+            state_kind="transport_error",
+            status_code=None,
+            error_kind="timeout",
+            error_detail=str(exc),
+            selected_html=None,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        return PageState(
+            state_kind="transport_error",
+            status_code=None,
+            error_kind="connection_error",
+            error_detail=str(exc),
+            selected_html=None,
+        )
+    except requests.RequestException as exc:
+        return PageState(
+            state_kind="transport_error",
+            status_code=None,
+            error_kind="request_error",
+            error_detail=str(exc),
+            selected_html=None,
+        )
 
     if resp.status_code != 200:
-        return PageState(status_code=resp.status_code, selected_html=None)
+        return PageState(
+            state_kind="http",
+            status_code=resp.status_code,
+            error_kind=None,
+            error_detail=None,
+            selected_html=None,
+        )
 
     soup = BeautifulSoup(resp.text, "html.parser")
     element = soup.select_one(selector)
     if element is None:
         raise ValueError(f"Selector not found: {selector}")
 
-    return PageState(status_code=resp.status_code, selected_html=str(element))
+    return PageState(
+        state_kind="http",
+        status_code=resp.status_code,
+        error_kind=None,
+        error_detail=None,
+        selected_html=str(element),
+    )
 
 
 def fetch_selected_html(url: str, selector: str) -> str:
     state = fetch_page_state(url, selector)
+    if state.state_kind != "http":
+        raise ValueError(
+            f"Expected HTTP 200 but got transport error: {state.error_kind}"
+        )
     if state.status_code != 200:
         raise ValueError(f"Expected HTTP 200 but got HTTP {state.status_code}")
     if state.selected_html is None:
@@ -97,27 +149,64 @@ def _load_previous_state(cache_path: Path) -> Optional[PageState]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return PageState(status_code=200, selected_html=raw)
+        return PageState(
+            state_kind="http",
+            status_code=200,
+            error_kind=None,
+            error_detail=None,
+            selected_html=raw,
+        )
 
     if not isinstance(data, dict):
         return None
 
+    state_kind = data.get("state_kind")
     status_code = data.get("status_code")
+    error_kind = data.get("error_kind")
+    error_detail = data.get("error_detail")
     selected_html = data.get("selected_html")
-    if not isinstance(status_code, int):
+    if state_kind is None:
+        if isinstance(status_code, int):
+            state_kind = "http"
+        else:
+            return None
+    if not isinstance(state_kind, str):
+        return None
+    if status_code is not None and not isinstance(status_code, int):
+        return None
+    if error_kind is not None and not isinstance(error_kind, str):
+        return None
+    if error_detail is not None and not isinstance(error_detail, str):
         return None
     if selected_html is not None and not isinstance(selected_html, str):
         return None
 
-    return PageState(status_code=status_code, selected_html=selected_html)
+    return PageState(
+        state_kind=state_kind,
+        status_code=status_code,
+        error_kind=error_kind,
+        error_detail=error_detail,
+        selected_html=selected_html,
+    )
 
 
 def _save_state(cache_path: Path, state: PageState) -> None:
     payload = {
+        "state_kind": state.state_kind,
         "status_code": state.status_code,
+        "error_kind": state.error_kind,
+        "error_detail": state.error_detail,
         "selected_html": state.selected_html,
     }
     cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def describe_state(state: PageState) -> str:
+    if state.state_kind == "http":
+        return f"HTTP {state.status_code}"
+    if state.error_kind:
+        return state.error_kind
+    return state.state_kind
 
 
 def _build_diff(previous_html: str, current_html: str) -> Optional[str]:
@@ -148,7 +237,7 @@ def check_page_for_changes(url: str, selector: str) -> ChangeResult:
 
     _save_state(cache_path, current_state)
 
-    previous_status_code = None if previous_state is None else previous_state.status_code
+    previous_state_label = None if previous_state is None else describe_state(previous_state)
     diff_text: Optional[str] = None
 
     if (
@@ -159,8 +248,8 @@ def check_page_for_changes(url: str, selector: str) -> ChangeResult:
         diff_text = _build_diff(previous_state.selected_html, current_state.selected_html)
 
     return ChangeResult(
-        previous_status_code=previous_status_code,
-        current_status_code=current_state.status_code,
+        previous_state_label=previous_state_label,
+        current_state_label=describe_state(current_state),
         diff_text=diff_text,
         selected_html=current_state.selected_html,
     )
@@ -179,13 +268,9 @@ def main() -> None:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(3)
-    except requests.RequestException as exc:
-        print(f"Network error: {exc}", file=sys.stderr)
-        sys.exit(4)
-
     if result.status_changed:
         print(
-            f"HTTP status changed: {result.previous_status_code} -> {result.current_status_code}"
+            f"State changed: {result.previous_state_label} -> {result.current_state_label}"
         )
     if result.diff_text:
         print(result.diff_text)
