@@ -31,9 +31,15 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_OWNER_USERNAME=kcimc
 CHECK_INTERVAL_SECONDS=300
+VIBECHECK_API_BASE_URL=http://vibecheck.local:8765
+VIBECHECK_API_TOKEN=
+VIBECHECK_TIMEOUT_SECONDS=180
 ```
 
 The app reads `.env`.
+
+`VIBECHECK_API_TOKEN` is optional and is sent as `Authorization: Bearer <token>`
+when configured.
 
 ## Usage
 
@@ -60,7 +66,15 @@ uv run python telegram_daemon.py
 ```json
 [
   { "url": "https://swappa.com/listings/macbook-air-2025-m4-15", "selector": "#section_main" },
-  { "url": "https://en.wikipedia.org/wiki/Special:RecentChanges", "selector": "#mw-content-text" }
+  {
+    "url": "https://en.wikipedia.org/wiki/Special:RecentChanges",
+    "selector": "#mw-content-text",
+    "reddit_post": {
+      "target": "/u/kcimc",
+      "title": "Wikipedia recent changes",
+      "body": "Screenshot of Special:RecentChanges from Wikipedia."
+    }
+  }
 ]
 ```
 
@@ -71,6 +85,7 @@ uv run python telegram_daemon.py
 - Transport failures such as invalid SSL certificates, timeouts, and connection errors are also tracked, so transitions like `ssl_error -> HTTP 200` trigger notifications.
 - Notifications are sent through the Telegram Bot API with a short Gemini-generated summary followed by the page URL.
 - The summarization uses `GEMINI_MODEL`, defaulting to `gemini-flash-latest`, via the `google-genai` Python SDK.
+- Jobs with `reddit_post` configured call the Vibecheck API after a detected update and submit a screenshot image post to the configured Reddit target. If the configured Reddit body contains `{summary}`, it is replaced with the generated change summary before posting. After a successful Vibecheck response, the job records `reddit_post.posted_at` and will not post that link to Reddit again unless Reddit posting is reconfigured for the job.
 - The Telegram bot accepts commands only from the configured owner username and chat ID.
 
 ## Telegram setup
@@ -97,9 +112,11 @@ CHECK_INTERVAL_SECONDS=300
 ## Telegram commands
 
 - `/follow <url> [selector]` adds a page to monitor. If no selector is provided, it uses `body`. Non-200 pages can still be followed so you can detect when they go live later.
+- `/reddit <number-or-id>` starts a prompt flow to configure Reddit posting for a followed page.
 - `/list` shows all followed pages and includes delete buttons.
 - `/interval` shows the current check interval.
 - `/interval <seconds>` sets the check interval. Minimum is `30`.
+- `/cancel` cancels an in-progress Reddit setup.
 - `/help` shows command help.
 
 ## systemd

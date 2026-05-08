@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,10 +19,65 @@ DEFAULT_OFFSET_PATH = Path(".telegram_offset")
 
 
 @dataclass
+class RedditPostConfig:
+    target: str
+    title: str
+    body: str
+    posted_at: Optional[str] = None
+    posted_request_id: Optional[str] = None
+
+
+@dataclass
 class Job:
     id: str
     url: str
     selector: str
+    reddit_post: Optional[RedditPostConfig] = None
+
+
+def _parse_reddit_post_config(
+    item: Dict[str, Any], index: int
+) -> Optional[RedditPostConfig]:
+    value = item.get("reddit_post")
+    if value is None:
+        return None
+
+    if not isinstance(value, dict):
+        raise ValueError(f"Item at index {index} has invalid 'reddit_post'")
+
+    target = value.get("target")
+    title = value.get("title")
+    body = value.get("body", "")
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError(
+            f"Item at index {index} must contain string 'reddit_post.target'"
+        )
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError(
+            f"Item at index {index} must contain string 'reddit_post.title'"
+        )
+    if not isinstance(body, str):
+        raise ValueError(
+            f"Item at index {index} must contain string 'reddit_post.body'"
+        )
+    posted_at = value.get("posted_at")
+    if posted_at is not None and not isinstance(posted_at, str):
+        raise ValueError(
+            f"Item at index {index} must contain string 'reddit_post.posted_at'"
+        )
+    posted_request_id = value.get("posted_request_id")
+    if posted_request_id is not None and not isinstance(posted_request_id, str):
+        raise ValueError(
+            f"Item at index {index} must contain string 'reddit_post.posted_request_id'"
+        )
+
+    return RedditPostConfig(
+        target=target.strip(),
+        title=title.strip(),
+        body=body,
+        posted_at=posted_at,
+        posted_request_id=posted_request_id,
+    )
 
 
 def load_jobs(json_path: Path = DEFAULT_JOBS_PATH) -> List[Job]:
@@ -49,7 +105,14 @@ def load_jobs(json_path: Path = DEFAULT_JOBS_PATH) -> List[Job]:
             job_id = uuid.uuid4().hex[:12]
             needs_save = True
 
-        jobs.append(Job(id=job_id, url=url, selector=selector))
+        jobs.append(
+            Job(
+                id=job_id,
+                url=url,
+                selector=selector,
+                reddit_post=_parse_reddit_post_config(item, idx),
+            )
+        )
 
     if needs_save:
         save_jobs(jobs, json_path)
@@ -58,10 +121,27 @@ def load_jobs(json_path: Path = DEFAULT_JOBS_PATH) -> List[Job]:
 
 
 def save_jobs(jobs: List[Job], json_path: Path = DEFAULT_JOBS_PATH) -> None:
-    payload = [
-        {"id": job.id, "url": job.url, "selector": job.selector}
-        for job in jobs
-    ]
+    payload: List[Dict[str, Any]] = []
+    for job in jobs:
+        item: Dict[str, Any] = {
+            "id": job.id,
+            "url": job.url,
+            "selector": job.selector,
+        }
+        if job.reddit_post is not None:
+            item["reddit_post"] = {
+                "target": job.reddit_post.target,
+                "title": job.reddit_post.title,
+                "body": job.reddit_post.body,
+            }
+            if job.reddit_post.posted_at is not None:
+                item["reddit_post"]["posted_at"] = job.reddit_post.posted_at
+            if job.reddit_post.posted_request_id is not None:
+                item["reddit_post"][
+                    "posted_request_id"
+                ] = job.reddit_post.posted_request_id
+        payload.append(item)
+
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -76,6 +156,68 @@ def add_job(url: str, selector: str, json_path: Path = DEFAULT_JOBS_PATH) -> Job
     jobs.append(new_job)
     save_jobs(jobs, json_path)
     return new_job
+
+
+def set_job_reddit_post(
+    job_id: str,
+    reddit_post: RedditPostConfig,
+    json_path: Path = DEFAULT_JOBS_PATH,
+) -> Optional[Job]:
+    jobs = load_jobs(json_path)
+    updated: Optional[Job] = None
+
+    for job in jobs:
+        if job.id == job_id:
+            job.reddit_post = reddit_post
+            updated = job
+            break
+
+    if updated is not None:
+        save_jobs(jobs, json_path)
+
+    return updated
+
+
+def mark_job_reddit_post_success(
+    *,
+    job_id: str,
+    posted_config: RedditPostConfig,
+    reddit_result: Dict[str, Any],
+    json_path: Path = DEFAULT_JOBS_PATH,
+) -> Optional[Job]:
+    jobs = load_jobs(json_path)
+    updated: Optional[Job] = None
+
+    request_id = reddit_result.get("request_id")
+    posted_request_id = request_id if isinstance(request_id, str) else None
+    posted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for job in jobs:
+        if job.id != job_id or job.reddit_post is None:
+            continue
+        if (
+            job.reddit_post.target != posted_config.target
+            or job.reddit_post.title != posted_config.title
+            or job.reddit_post.body != posted_config.body
+        ):
+            return None
+
+        job.reddit_post.posted_at = posted_at
+        job.reddit_post.posted_request_id = posted_request_id
+        updated = job
+        break
+
+    if updated is not None:
+        save_jobs(jobs, json_path)
+
+    return updated
+
+
+def get_job_by_id(job_id: str, json_path: Path = DEFAULT_JOBS_PATH) -> Optional[Job]:
+    for job in load_jobs(json_path):
+        if job.id == job_id:
+            return job
+    return None
 
 
 def delete_job(job_id: str, json_path: Path = DEFAULT_JOBS_PATH) -> Optional[Job]:
@@ -175,6 +317,50 @@ def send_telegram_message(
     return resp.json()
 
 
+def _format_reddit_api_error(data: Dict[str, Any]) -> str:
+    error = data.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        if code and message:
+            return f"{code}: {message}"
+        if message:
+            return str(message)
+    return json.dumps(data, sort_keys=True)[:500]
+
+
+def post_reddit_update(job: Job, body: Optional[str] = None) -> Dict[str, Any]:
+    if job.reddit_post is None:
+        raise ValueError("Job does not have Reddit posting configured")
+
+    base_url = os.getenv("VIBECHECK_API_BASE_URL", "http://vibecheck.local:8765").strip()
+    if not base_url:
+        raise ValueError("VIBECHECK_API_BASE_URL cannot be empty")
+
+    timeout_seconds = int(os.getenv("VIBECHECK_TIMEOUT_SECONDS", "180").strip())
+    api_url = f"{base_url.rstrip('/')}/posts"
+    payload = {
+        "target": job.reddit_post.target,
+        "page_url": job.url,
+        "title": job.reddit_post.title,
+        "body": job.reddit_post.body if body is None else body,
+    }
+    headers = {"Content-Type": "application/json"}
+    api_token = os.getenv("VIBECHECK_API_TOKEN", "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    print(f"[reddit] POST {api_url} target={job.reddit_post.target} url={job.url}")
+    resp = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
+    print(f"[reddit] status={resp.status_code}")
+    resp.raise_for_status()
+
+    data = resp.json()
+    if not data.get("ok"):
+        raise ValueError(_format_reddit_api_error(data))
+    return data
+
+
 def telegram_api_post(
     *, bot_token: str, method: str, payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -224,7 +410,7 @@ def validate_follow_target(url: str, selector: str) -> None:
         raise ValueError(f"Selector not found: {selector}")
 
 
-def build_notification_message(
+def build_change_summary(
     *,
     url: str,
     selector: str,
@@ -263,8 +449,15 @@ def build_notification_message(
     if not parts:
         return None
 
-    parts.append(url)
     return "\n".join(parts)
+
+
+def build_notification_message(*, change_summary: str, url: str) -> str:
+    return "\n".join([change_summary, url])
+
+
+def render_reddit_post_body(template: str, change_summary: str) -> str:
+    return template.replace("{summary}", change_summary)
 
 
 def monitor_jobs_once(
@@ -288,14 +481,19 @@ def monitor_jobs_once(
             continue
 
         change_count += 1
-        message_body = build_notification_message(
+        change_summary = build_change_summary(
             url=job.url,
             selector=job.selector,
             change=change,
             gemini_client=gemini_client,
         )
-        if not message_body:
+        if not change_summary:
             continue
+
+        message_body = build_notification_message(
+            change_summary=change_summary,
+            url=job.url,
+        )
 
         try:
             send_telegram_message(
@@ -305,6 +503,76 @@ def monitor_jobs_once(
             )
         except Exception as exc:
             print(f"[{job.url}] Telegram send error: {exc}")
+
+        current_job = get_job_by_id(job.id, jobs_path)
+        if current_job is None:
+            print(f"[{job.url}] Job was deleted before Reddit post step; skipping")
+            continue
+
+        if current_job.reddit_post is not None:
+            if current_job.reddit_post.posted_at is not None:
+                print(
+                    f"[{job.url}] Reddit post already succeeded at "
+                    f"{current_job.reddit_post.posted_at}; skipping"
+                )
+                continue
+
+            try:
+                posted_config = current_job.reddit_post
+                reddit_body = render_reddit_post_body(
+                    current_job.reddit_post.body,
+                    change_summary,
+                )
+                reddit_result = post_reddit_update(current_job, body=reddit_body)
+            except Exception as exc:
+                print(f"[{job.url}] Reddit post error: {exc}")
+                try:
+                    send_telegram_message(
+                        bot_token=bot_token,
+                        chat_id=chat_id,
+                        body=(
+                            "Reddit post failed for updated page:\n"
+                            f"{job.url}\n"
+                            f"Target: {current_job.reddit_post.target}\n"
+                            f"Error: {exc}"
+                        ),
+                    )
+                except Exception as telegram_exc:
+                    print(f"[{job.url}] Telegram send error: {telegram_exc}")
+                continue
+
+            marked = mark_job_reddit_post_success(
+                job_id=current_job.id,
+                posted_config=posted_config,
+                reddit_result=reddit_result,
+                json_path=jobs_path,
+            )
+            if marked is None:
+                print(
+                    f"[{job.url}] Reddit post succeeded, but success marker was not saved"
+                )
+
+            request_id = reddit_result.get("request_id")
+            submitted = reddit_result.get("submitted")
+            result_lines = [
+                "Reddit post submitted for updated page:"
+                if submitted
+                else "Reddit post prepared for updated page:",
+                job.url,
+                f"Target: {current_job.reddit_post.target}",
+                "Future Reddit posts for this link will be skipped.",
+            ]
+            if isinstance(request_id, str) and request_id:
+                result_lines.append(f"Request ID: {request_id}")
+
+            try:
+                send_telegram_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    body="\n".join(result_lines),
+                )
+            except Exception as exc:
+                print(f"[{job.url}] Telegram send error: {exc}")
 
     return change_count
 
