@@ -2,19 +2,18 @@ import sys
 import time
 import json
 import os
-import re
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
 
 from botlib import (
     DEFAULT_JOBS_PATH,
     DEFAULT_OFFSET_PATH,
-    RedditPostConfig,
     add_job,
     answer_callback_query,
     delete_job,
@@ -25,7 +24,6 @@ from botlib import (
     resolve_telegram_config,
     save_offset,
     send_telegram_message,
-    set_job_reddit_post,
     sleep_with_backoff,
     validate_follow_target,
 )
@@ -33,7 +31,6 @@ from botlib import (
 
 CHECK_INTERVAL_SECONDS = 300
 DEFAULT_CONFIG_PATH = Path(".bot_config.json")
-REDDIT_SETUP_CONFIG_KEY = "pending_reddit_setup"
 
 
 def parse_check_interval() -> int:
@@ -133,19 +130,10 @@ def build_jobs_reply() -> Tuple[str, Optional[Dict[str, Any]]]:
     buttons: List[List[Dict[str, str]]] = []
 
     for index, job in enumerate(jobs, start=1):
-        if job.reddit_post is None:
-            reddit_status = "Reddit: off"
-        elif job.reddit_post.posted_at is not None:
-            reddit_status = f"Reddit: {job.reddit_post.target}, posted"
-        else:
-            reddit_status = f"Reddit: {job.reddit_post.target}, pending"
-        lines.append(f"{index}. {job.url} [{job.selector}] ({reddit_status})")
+        mode_status = "robust" if job.mode == "robust" else "standard"
+        lines.append(f"{index}. {job.url} [{job.selector}] ({mode_status})")
         buttons.append(
             [
-                {
-                    "text": f"Configure Reddit {index}",
-                    "callback_data": f"reddit:{job.id}",
-                },
                 {
                     "text": f"Delete {index}",
                     "callback_data": f"delete:{job.id}",
@@ -160,12 +148,10 @@ def build_jobs_reply() -> Tuple[str, Optional[Dict[str, Any]]]:
 def send_help(bot_token: str, chat_id: str) -> None:
     help_text = (
         "Commands:\n"
-        "/follow <url> [selector] - add a page to monitor. Default selector is body.\n"
-        "/reddit <number-or-id> - configure Reddit posting for a followed page.\n"
+        "/follow <url> [selector] - choose robust or standard mode and follow a page. Default selector is body.\n"
         "/list - show followed links and delete buttons.\n"
         "/interval - show the current check interval.\n"
         "/interval <seconds> - set the check interval, minimum 30.\n"
-        "/cancel - cancel an in-progress Reddit setup.\n"
         "/help - show this message."
     )
     send_telegram_message(bot_token=bot_token, chat_id=chat_id, body=help_text)
@@ -175,7 +161,6 @@ def handle_follow(bot_token: str, chat_id: str, text: str) -> None:
     try:
         url, selector = normalize_follow_command(text)
         validate_follow_target(url, selector)
-        job = add_job(url, selector, DEFAULT_JOBS_PATH)
     except Exception as exc:
         send_telegram_message(
             bot_token=bot_token,
@@ -184,21 +169,37 @@ def handle_follow(bot_token: str, chat_id: str, text: str) -> None:
         )
         return
 
+    config = load_runtime_config()
+    request_id = uuid.uuid4().hex[:12]
+    config["pending_follow"] = {
+        "id": request_id, "chat_id": chat_id, "url": url,
+        "selector": selector, "stage": "mode",
+    }
+    save_runtime_config(config)
     send_telegram_message(
         bot_token=bot_token,
         chat_id=chat_id,
-        body=f"Following:\n{job.url}\nSelector: {job.selector}",
-        reply_markup={
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "Configure Reddit posting",
-                        "callback_data": f"reddit:{job.id}",
-                    }
-                ]
-            ]
-        },
+        body=(f"Use robust mode for this link?\n{url}\nSelector: {selector}\n"
+              "Robust mode only notifies about changes matching your criteria. "
+              "Standard mode notifies about every detected change."),
+        reply_markup={"inline_keyboard": [[
+            {"text": "Yes, robust", "callback_data": f"follow:{request_id}:robust"},
+            {"text": "No, standard", "callback_data": f"follow:{request_id}:standard"},
+        ]]},
     )
+
+
+def finish_follow(bot_token: str, chat_id: str, config: Dict[str, Any],
+                  mode: str, criteria: Optional[str] = None) -> None:
+    pending = config["pending_follow"]
+    job = add_job(pending["url"], pending["selector"], DEFAULT_JOBS_PATH,
+                  mode=mode, change_criteria=criteria)
+    del config["pending_follow"]
+    save_runtime_config(config)
+    body = f"Following:\n{job.url}\nSelector: {job.selector}\nMode: {job.mode}"
+    if job.change_criteria:
+        body += f"\nNotify when: {job.change_criteria}"
+    send_telegram_message(bot_token=bot_token, chat_id=chat_id, body=body)
 
 
 def handle_list(bot_token: str, chat_id: str) -> None:
@@ -241,240 +242,6 @@ def handle_interval(bot_token: str, chat_id: str, text: str) -> Optional[int]:
     return current
 
 
-def normalize_reddit_target(raw_target: str) -> str:
-    target = raw_target.strip()
-    if re.match(r"^[uUrR]/", target):
-        target = f"/{target}"
-
-    match = re.fullmatch(r"/([uUrR])/([A-Za-z0-9][A-Za-z0-9_-]{0,30})", target)
-    if not match:
-        raise ValueError("Send a target like /u/kcimc or /r/UFOs.")
-
-    return f"/{match.group(1).lower()}/{match.group(2)}"
-
-
-def get_reddit_setup(config_path: Path = DEFAULT_CONFIG_PATH) -> Optional[Dict[str, Any]]:
-    pending = load_runtime_config(config_path).get(REDDIT_SETUP_CONFIG_KEY)
-    if not isinstance(pending, dict):
-        return None
-    if not isinstance(pending.get("job_id"), str):
-        return None
-    if not isinstance(pending.get("step"), str):
-        return None
-    return pending
-
-
-def save_reddit_setup(
-    pending: Dict[str, Any], config_path: Path = DEFAULT_CONFIG_PATH
-) -> None:
-    config = load_runtime_config(config_path)
-    config[REDDIT_SETUP_CONFIG_KEY] = pending
-    save_runtime_config(config, config_path)
-
-
-def clear_reddit_setup(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-    config = load_runtime_config(config_path)
-    if REDDIT_SETUP_CONFIG_KEY in config:
-        del config[REDDIT_SETUP_CONFIG_KEY]
-        save_runtime_config(config, config_path)
-
-
-def find_job_by_id(job_id: str) -> Optional[Any]:
-    for job in load_jobs(DEFAULT_JOBS_PATH):
-        if job.id == job_id:
-            return job
-    return None
-
-
-def find_job_by_reference(reference: str) -> Optional[Any]:
-    token = reference.strip()
-    jobs = load_jobs(DEFAULT_JOBS_PATH)
-    if token.isdigit():
-        index = int(token) - 1
-        if 0 <= index < len(jobs):
-            return jobs[index]
-
-    for job in jobs:
-        if job.id == token or job.url == token:
-            return job
-    return None
-
-
-def start_reddit_setup(bot_token: str, chat_id: str, job_id: str) -> None:
-    job = find_job_by_id(job_id)
-    if job is None:
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="Could not find that followed page. Use /list to refresh.",
-        )
-        return
-
-    save_reddit_setup({"job_id": job.id, "step": "target"})
-    prompt_lines = [
-        "Where should updates post?",
-        "Send a target like /u/kcimc or /r/UFOs.",
-        "",
-        f"Page: {job.url}",
-    ]
-    if job.reddit_post is not None:
-        prompt_lines.extend(["", f"Current target: {job.reddit_post.target}"])
-
-    send_telegram_message(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        body="\n".join(prompt_lines),
-    )
-
-
-def handle_reddit_command(bot_token: str, chat_id: str, text: str) -> None:
-    parts = text.split(maxsplit=1)
-    if len(parts) == 1:
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="Usage: /reddit <number-or-id>. Use /list to see followed pages.",
-        )
-        return
-
-    job = find_job_by_reference(parts[1])
-    if job is None:
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="Could not find that followed page. Use /list to see the numbers.",
-        )
-        return
-
-    start_reddit_setup(bot_token, chat_id, job.id)
-
-
-def handle_pending_reddit_setup(bot_token: str, chat_id: str, text: str) -> bool:
-    pending = get_reddit_setup()
-    if pending is None:
-        return False
-
-    if text.strip() == "/cancel":
-        clear_reddit_setup()
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="Canceled Reddit setup.",
-        )
-        return True
-
-    job = find_job_by_id(pending["job_id"])
-    if job is None:
-        clear_reddit_setup()
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="The followed page for this Reddit setup no longer exists.",
-        )
-        return True
-
-    step = pending["step"]
-    if step == "target":
-        try:
-            target = normalize_reddit_target(text)
-        except ValueError as exc:
-            send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                body=str(exc),
-            )
-            return True
-
-        save_reddit_setup({"job_id": job.id, "step": "title", "target": target})
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="What title should the Reddit post use?",
-        )
-        return True
-
-    if step == "title":
-        title = text.strip()
-        if not title:
-            send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                body="Title cannot be empty.",
-            )
-            return True
-
-        target = pending.get("target")
-        if not isinstance(target, str):
-            clear_reddit_setup()
-            send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                body="Reddit setup state was incomplete. Start again with /reddit.",
-            )
-            return True
-
-        save_reddit_setup(
-            {"job_id": job.id, "step": "body", "target": target, "title": title}
-        )
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body=(
-                "What body text should the Reddit post use?\n"
-                "Use {summary} to insert the generated change summary."
-            ),
-        )
-        return True
-
-    if step == "body":
-        target = pending.get("target")
-        title = pending.get("title")
-        if not isinstance(target, str) or not isinstance(title, str):
-            clear_reddit_setup()
-            send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                body="Reddit setup state was incomplete. Start again with /reddit.",
-            )
-            return True
-
-        body = text.strip()
-        updated = set_job_reddit_post(
-            job.id,
-            RedditPostConfig(target=target, title=title, body=body),
-            DEFAULT_JOBS_PATH,
-        )
-        clear_reddit_setup()
-        if updated is None:
-            send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                body="Could not save Reddit posting for that followed page.",
-            )
-            return True
-
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body=(
-                "Reddit posting configured for updates:\n"
-                f"{updated.url}\n"
-                f"Target: {target}\n"
-                f"Title: {title}\n"
-                f"Body: {body}"
-            ),
-        )
-        return True
-
-    clear_reddit_setup()
-    send_telegram_message(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        body="Reddit setup state was invalid. Start again with /reddit.",
-    )
-    return True
-
-
 def handle_message(
     *,
     bot_token: str,
@@ -490,9 +257,6 @@ def handle_message(
     if not text:
         return None
 
-    if handle_pending_reddit_setup(bot_token, chat_id, text):
-        return None
-
     command = text.split(maxsplit=1)[0].split("@", 1)[0]
     if command in {"/start", "/help"}:
         send_help(bot_token, chat_id)
@@ -502,24 +266,19 @@ def handle_message(
         handle_follow(bot_token, chat_id, text)
         return None
 
-    if command == "/reddit":
-        handle_reddit_command(bot_token, chat_id, text)
-        return None
-
-    if command == "/cancel":
-        send_telegram_message(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            body="No Reddit setup is in progress.",
-        )
-        return None
-
     if command == "/list":
         handle_list(bot_token, chat_id)
         return None
 
     if command == "/interval":
         return handle_interval(bot_token, chat_id, text)
+
+    config = load_runtime_config()
+    pending = config.get("pending_follow", {})
+    if (not text.startswith("/") and pending.get("chat_id") == chat_id
+            and pending.get("stage") == "criteria"):
+        finish_follow(bot_token, chat_id, config, "robust", text)
+        return None
 
     send_telegram_message(
         bot_token=bot_token,
@@ -551,10 +310,27 @@ def handle_callback_query(
         return
 
     data = callback_query.get("data") or ""
-    if data.startswith("reddit:"):
-        job_id = data.split(":", 1)[1]
-        try_answer_callback_query("Starting Reddit setup.")
-        start_reddit_setup(bot_token, chat_id, job_id)
+    if data.startswith("follow:"):
+        config = load_runtime_config()
+        pending = config.get("pending_follow", {})
+        parts = data.split(":")
+        if (len(parts) != 3 or pending.get("id") != parts[1]
+                or pending.get("chat_id") != chat_id
+                or pending.get("stage") != "mode"
+                or parts[2] not in {"standard", "robust"}):
+            try_answer_callback_query("This question is no longer active. Use /follow again.")
+            return
+        try_answer_callback_query()
+        if parts[2] == "standard":
+            finish_follow(bot_token, chat_id, config, "standard")
+        else:
+            pending["stage"] = "criteria"
+            save_runtime_config(config)
+            send_telegram_message(
+                bot_token=bot_token, chat_id=chat_id,
+                body=(f"What changes should trigger a notification for {pending['url']}?\n"
+                      "Reply with your criteria, such as price or availability changes."),
+            )
         return
 
     if not data.startswith("delete:"):
@@ -623,7 +399,7 @@ def process_updates(
 
 def run_monitor_pass(
     *,
-    gemini_client: genai.Client,
+    openai_client: OpenAI,
     bot_token: str,
     chat_id: str,
 ) -> None:
@@ -631,7 +407,7 @@ def run_monitor_pass(
     print("[daemon] Monitor pass started")
     try:
         change_count = monitor_jobs_once(
-            gemini_client=gemini_client,
+            openai_client=openai_client,
             bot_token=bot_token,
             chat_id=chat_id,
             jobs_path=DEFAULT_JOBS_PATH,
@@ -649,14 +425,14 @@ def run_monitor_pass(
 
 def start_monitor_thread(
     *,
-    gemini_client: genai.Client,
+    openai_client: OpenAI,
     bot_token: str,
     chat_id: str,
 ) -> threading.Thread:
     thread = threading.Thread(
         target=run_monitor_pass,
         kwargs={
-            "gemini_client": gemini_client,
+            "openai_client": openai_client,
             "bot_token": bot_token,
             "chat_id": chat_id,
         },
@@ -671,7 +447,10 @@ def main() -> int:
     load_dotenv(override=True)
 
     try:
-        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY in environment/.env")
+        openai_client = OpenAI(api_key=api_key)
         bot_token, chat_id, owner_username = resolve_telegram_config()
     except Exception as exc:
         print(f"Startup error: {exc}", file=sys.stderr)
@@ -695,7 +474,7 @@ def main() -> int:
             now = time.monotonic()
             if monitor_thread is None and now >= next_check_at:
                 monitor_thread = start_monitor_thread(
-                    gemini_client=gemini_client,
+                    openai_client=openai_client,
                     bot_token=bot_token,
                     chat_id=chat_id,
                 )

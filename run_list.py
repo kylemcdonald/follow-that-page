@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
 
 from botlib import monitor_jobs_once, resolve_telegram_config
 
@@ -12,9 +12,12 @@ def main() -> int:
     load_dotenv(override=True)
 
     try:
-        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY in environment/.env")
+        openai_client = OpenAI(api_key=api_key)
     except Exception as exc:
-        print(f"Gemini client init error: {exc}", file=sys.stderr)
+        print(f"OpenAI client init error: {exc}", file=sys.stderr)
         return 2
 
     if len(sys.argv) == 1:
@@ -32,7 +35,7 @@ def main() -> int:
         return 2
 
     monitor_jobs_once(
-        gemini_client=gemini_client,
+        openai_client=openai_client,
         bot_token=telegram_bot_token,
         chat_id=telegram_chat_id,
         jobs_path=jobs_path,

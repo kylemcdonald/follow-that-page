@@ -1,12 +1,7 @@
 [
   {
-    "url": "https://swappa.com/listings/macbook-air-2025-m4-15",
-    "selector": "#section_main"
-  },
-  {
-    "url": "https://en.wikipedia.org/wiki/Special:RecentChanges",
-    "selector": "#mw-content-text"
+    "id": "12ed18fd28e4",
+    "url": "https://www.apple.com/ca/shop/refurbished/mac/macbook-air",
+    "selector": "body"
   }
 ]
-
-

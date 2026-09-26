@@ -1,8 +1,4 @@
 beautifulsoup4>=4.13.4
 requests>=2.32.4
-requests
-beautifulsoup4
 python-dotenv>=1.0.1
-google-genai>=1.0.0
-
-
+openai>=1.66.0
