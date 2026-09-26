@@ -50,6 +50,18 @@ class FollowFlowTests(unittest.TestCase):
         self.assertEqual((job.mode, job.change_criteria), ('robust', 'Only price changes'))
         self.assertNotIn('pending_follow', daemon.load_runtime_config())
 
+    def test_text_choice_is_offered_saved_and_listed_without_criteria(self):
+        request_id = self.begin()
+        buttons = self.send.call_args.kwargs['reply_markup']['inline_keyboard']
+        self.assertTrue(any(button['callback_data'] == f'follow:{request_id}:text'
+                            for row in buttons for button in row))
+        self.choose(request_id, 'text')
+        job = botlib.load_jobs()[0]
+        self.assertEqual(job.mode, 'text')
+        self.assertIsNone(job.change_criteria)
+        self.assertNotIn('pending_follow', daemon.load_runtime_config())
+        self.assertIn('(text only)', daemon.build_jobs_reply()[0])
+
     def test_unauthorized_choice_does_not_save_job(self):
         self.choose(self.begin(), 'standard', username='stranger')
         self.assertEqual(botlib.load_jobs(), [])

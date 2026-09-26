@@ -44,6 +44,12 @@ The app reads `.env`.
 uv run follow_that_page.py "https://example.com" "#main"
 ```
 
+- Compare only normalized text (ignore scripts and HTML attributes):
+
+```bash
+uv run follow_that_page.py "https://example.com" "#main" text
+```
+
 - Batch mode using a JSON job list (see `jobs.json`):
 
 ```bash
@@ -77,6 +83,8 @@ uv run python telegram_daemon.py
 - Notifications are sent through the Telegram Bot API with an OpenAI-generated summary followed by the page URL.
 - The OpenAI client uses `OPENAI_MODEL`, defaulting to `gpt-6-luna`, and `OPENAI_REASONING_EFFORT`, defaulting to `minimal`.
 - Jobs use `standard` mode by default, which notifies on every detected selector or state change. A `robust` job asks the model to evaluate each content diff against its required `change_criteria`. It sends an update only when the model finds clear evidence that the criterion was met; errors, incomplete output, state-only changes, and uncertain results are suppressed.
+- Set `"mode": "text"` for text-only comparison, with no criteria required. This mode strips scripts, styles, templates, noscript content, comments, and HTML attributes, and normalizes whitespace before comparing text. It suppresses status-only alerts and retains the last successful baseline across outages. Existing HTML caches work immediately when switching modes. Only changed text is sent for summarization.
+- Text mode compares the fetched HTML, without running JavaScript or evaluating CSS visibility. It can include hidden or unrelated text and miss changes represented only in attributes or scripts. For example, Apple's MacBook Air URL includes other Mac inventory in its source HTML; text mode removes rotating URL-token noise but does not filter that inventory to MacBook Air. Use a narrower selector or robust criteria when needed.
 - The Telegram bot accepts commands only from the configured owner username and chat ID.
 
 ## Telegram setup
@@ -102,7 +110,7 @@ CHECK_INTERVAL_SECONDS=300
 
 ## Telegram commands
 
-- `/follow <url> [selector]` asks whether to use robust mode before saving the page. Choose standard mode to follow immediately, or robust mode and then reply with the changes that should trigger notifications. The mode and criteria are saved for that link. If no selector is provided, it uses `body`. Non-200 pages can still be followed so you can detect when they go live later. A new `/follow` replaces any unfinished follow question; following an existing URL and selector updates its mode.
+- `/follow <url> [selector]` offers Standard, Robust, and Text only modes before saving the page. Standard and Text only save immediately; Robust asks for the changes that should trigger notifications. The mode and criteria are saved for that link. If no selector is provided, it uses `body`. Non-200 pages can still be followed; standard mode reports status transitions when they go live. A new `/follow` replaces any unfinished follow question; following an existing URL and selector updates its mode.
 - `/list` shows all followed pages, their monitoring mode, and delete buttons.
 - `/interval` shows the current check interval.
 - `/interval <seconds>` sets the check interval. Minimum is `30`.

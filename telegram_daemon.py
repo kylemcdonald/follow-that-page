@@ -130,7 +130,7 @@ def build_jobs_reply() -> Tuple[str, Optional[Dict[str, Any]]]:
     buttons: List[List[Dict[str, str]]] = []
 
     for index, job in enumerate(jobs, start=1):
-        mode_status = "robust" if job.mode == "robust" else "standard"
+        mode_status = "text only" if job.mode == "text" else job.mode
         lines.append(f"{index}. {job.url} [{job.selector}] ({mode_status})")
         buttons.append(
             [
@@ -148,7 +148,7 @@ def build_jobs_reply() -> Tuple[str, Optional[Dict[str, Any]]]:
 def send_help(bot_token: str, chat_id: str) -> None:
     help_text = (
         "Commands:\n"
-        "/follow <url> [selector] - choose robust or standard mode and follow a page. Default selector is body.\n"
+        "/follow <url> [selector] - choose standard, robust, or text-only mode. Default selector is body.\n"
         "/list - show followed links and delete buttons.\n"
         "/interval - show the current check interval.\n"
         "/interval <seconds> - set the check interval, minimum 30.\n"
@@ -179,12 +179,14 @@ def handle_follow(bot_token: str, chat_id: str, text: str) -> None:
     send_telegram_message(
         bot_token=bot_token,
         chat_id=chat_id,
-        body=(f"Use robust mode for this link?\n{url}\nSelector: {selector}\n"
+        body=(f"Choose a monitoring mode for this link:\n{url}\nSelector: {selector}\n"
               "Robust mode only notifies about changes matching your criteria. "
-              "Standard mode notifies about every detected change."),
+              "Standard mode notifies about every detected change. "
+              "Text only ignores scripts, markup, and status-only changes."),
         reply_markup={"inline_keyboard": [[
-            {"text": "Yes, robust", "callback_data": f"follow:{request_id}:robust"},
-            {"text": "No, standard", "callback_data": f"follow:{request_id}:standard"},
+            {"text": "Standard", "callback_data": f"follow:{request_id}:standard"},
+            {"text": "Robust", "callback_data": f"follow:{request_id}:robust"},
+            {"text": "Text only", "callback_data": f"follow:{request_id}:text"},
         ]]},
     )
 
@@ -317,12 +319,12 @@ def handle_callback_query(
         if (len(parts) != 3 or pending.get("id") != parts[1]
                 or pending.get("chat_id") != chat_id
                 or pending.get("stage") != "mode"
-                or parts[2] not in {"standard", "robust"}):
+                or parts[2] not in {"standard", "robust", "text"}):
             try_answer_callback_query("This question is no longer active. Use /follow again.")
             return
         try_answer_callback_query()
-        if parts[2] == "standard":
-            finish_follow(bot_token, chat_id, config, "standard")
+        if parts[2] in {"standard", "text"}:
+            finish_follow(bot_token, chat_id, config, parts[2])
         else:
             pending["stage"] = "criteria"
             save_runtime_config(config)

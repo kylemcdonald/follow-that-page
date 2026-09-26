@@ -14,7 +14,7 @@ from follow_that_page import ChangeResult, check_page_for_changes, fetch_page_st
 
 DEFAULT_JOBS_PATH = Path("jobs.json")
 DEFAULT_OFFSET_PATH = Path(".telegram_offset")
-VALID_JOB_MODES = {"standard", "robust"}
+VALID_JOB_MODES = {"standard", "robust", "text"}
 
 
 @dataclass
@@ -110,8 +110,9 @@ def save_jobs(jobs: List[Job], json_path: Path = DEFAULT_JOBS_PATH) -> None:
             "url": job.url,
             "selector": job.selector,
         }
+        if job.mode != "standard":
+            item["mode"] = job.mode
         if job.mode == "robust":
-            item["mode"] = "robust"
             item["change_criteria"] = job.change_criteria
         payload.append(item)
 
@@ -413,7 +414,7 @@ def monitor_jobs_once(
 
     for job in jobs:
         try:
-            change = check_page_for_changes(job.url, job.selector)
+            change = check_page_for_changes(job.url, job.selector, mode=job.mode)
         except ValueError as exc:
             print(f"[{job.url}] selector error: {exc}")
             continue

@@ -230,12 +230,39 @@ def _build_diff(previous_html: str, current_html: str) -> Optional[str]:
     return "\n".join(diff_iter)
 
 
-def check_page_for_changes(url: str, selector: str) -> ChangeResult:
+def _text_lines(html: str) -> list:
+    """Extract source text, excluding non-content elements (no browser/CSS rendering)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup.select("script, style, template, noscript"):
+        element.decompose()
+    return [line for text in soup.stripped_strings
+            if (line := " ".join(text.split()))]
+
+
+def _build_text_diff(previous_html: str, current_html: str) -> Optional[str]:
+    previous_lines = _text_lines(previous_html)
+    current_lines = _text_lines(current_html)
+    # Inline wrappers and text-node boundaries alone are not content changes.
+    if " ".join(previous_lines) == " ".join(current_lines):
+        return None
+    return "\n".join(difflib.unified_diff(
+        previous_lines, current_lines, fromfile="previous", tofile="current", lineterm="",
+    ))
+
+
+def check_page_for_changes(
+    url: str, selector: str, *, mode: str = "standard",
+) -> ChangeResult:
+    if mode not in {"standard", "robust", "text"}:
+        raise ValueError(f"Unknown monitoring mode: {mode}")
     current_state = fetch_page_state(url, selector)
     cache_path = get_cache_path(url, selector)
     previous_state = _load_previous_state(cache_path)
 
-    _save_state(cache_path, current_state)
+    # Keep the last successful text baseline across outages, so recovery does not
+    # hide content changes. Raw HTML keeps existing caches usable in every mode.
+    if mode != "text" or current_state.selected_html is not None:
+        _save_state(cache_path, current_state)
 
     previous_state_label = None if previous_state is None else describe_state(previous_state)
     diff_text: Optional[str] = None
@@ -245,10 +272,11 @@ def check_page_for_changes(url: str, selector: str) -> ChangeResult:
         and previous_state.selected_html is not None
         and current_state.selected_html is not None
     ):
-        diff_text = _build_diff(previous_state.selected_html, current_state.selected_html)
+        build_diff = _build_text_diff if mode == "text" else _build_diff
+        diff_text = build_diff(previous_state.selected_html, current_state.selected_html)
 
     return ChangeResult(
-        previous_state_label=previous_state_label,
+        previous_state_label=None if mode == "text" else previous_state_label,
         current_state_label=describe_state(current_state),
         diff_text=diff_text,
         selected_html=current_state.selected_html,
@@ -256,15 +284,18 @@ def check_page_for_changes(url: str, selector: str) -> ChangeResult:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        print("Usage: python follow-that-page.py <url> <selector>", file=sys.stderr)
+    if len(sys.argv) not in {3, 4}:
+        print("Usage: python follow_that_page.py <url> <selector> [standard|text]", file=sys.stderr)
         sys.exit(2)
 
     url = sys.argv[1]
     selector = sys.argv[2]
 
     try:
-        result = check_page_for_changes(url, selector)
+        mode = sys.argv[3] if len(sys.argv) == 4 else "standard"
+        if mode not in {"standard", "text"}:
+            raise ValueError("CLI mode must be standard or text")
+        result = check_page_for_changes(url, selector, mode=mode)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(3)
